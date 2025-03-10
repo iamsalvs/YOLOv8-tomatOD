@@ -3,46 +3,62 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from ultralytics import YOLO
-from torchvision.models import mobilenet_v2, shufflenet_v2_x1_0, efficientnet_b0
-
 
 class CustomBackbone(nn.Module):
-    """EfficientNet-B0 Backbone for YOLOv8 with Feature Map Extraction"""
+    """EfficientNet-B0 Backbone for YOLOv8 with Feature Map Extraction and Channel Adjustment"""
+    
     def __init__(self, backbone_type='efficientnet', **kwargs):
         super().__init__()
         
         if backbone_type == 'efficientnet':
             self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-            self.out_channels = [24, 40, 112, 320]  # Feature map sizes similar to YOLO's backbone
-            
+            self.out_channels = [24, 40, 112]  # EfficientNet feature maps
+
+        # Extract feature layers from EfficientNet
         self.feature_layers = self._get_feature_layers()
+
+        # Channel adapters to match YOLO expectations
+        self.channel_adapter = nn.ModuleList([
+            nn.Conv2d(24, 256, kernel_size=1),  # Adjust P3: 24 -> 256
+            nn.Conv2d(40, 512, kernel_size=1),  # Adjust P4: 40 -> 512
+            nn.Conv2d(112, 1024, kernel_size=1) # Adjust P5: 112 -> 1024
+        ])
 
     def _get_feature_layers(self):
         """Extracts feature layers from EfficientNet"""
-        return {
-            'layer1': nn.Sequential(self.backbone.features[:2]),  # Low-level features (P1/P2)
-            'layer2': nn.Sequential(self.backbone.features[2:3]),  # P3/8 (Low-level features)
-            'layer3': nn.Sequential(self.backbone.features[3:5]),  # P4/16 (Mid-level features)
-            'layer4': nn.Sequential(self.backbone.features[5:])  # P5/32 (High-level features)
-        }
+        return nn.ModuleDict({
+            'P3': nn.Sequential(self.backbone.features[:3]),  # P3/8
+            'P4': nn.Sequential(self.backbone.features[3:5]), # P4/16
+            'P5': nn.Sequential(self.backbone.features[5:])   # P5/32
+        })
 
     def forward(self, x):
         features = []
-        for layer in self.feature_layers.values():
+        for i, (name, layer) in enumerate(self.feature_layers.items()):
             x = layer(x)
+            x = self.channel_adapter[i](x)  # Adjust feature map channels
+            print(f"✅ Feature Map {name}: {x.shape}")  # Debugging output
             features.append(x)
-        return features  # Returns [P3, P4, P5] to YOLOv8's detection head
+        return features  # Returns [P3, P4, P5] to YOLO head
 
 def modify_model_for_efficientnet(yolo_model):
-    """Replace YOLO's backbone with EfficientNet-B0 and extract feature maps."""
+    """Replace YOLO's default backbone with EfficientNet-B0"""
     custom_backbone = CustomBackbone(backbone_type='efficientnet')
-    yolo_model.model.model[0] = custom_backbone  # Replace YOLO backbone
+
+    # Ensure YOLO model follows expected structure
+    if hasattr(yolo_model.model, 'model') and len(yolo_model.model.model) > 0:
+        yolo_model.model.model[0] = custom_backbone  # Replace YOLO backbone
+    else:
+        print("❌ Error: YOLOv8 model structure not recognized!")
+
+    # Debugging: Print model structure
+    print("✅ Modified YOLO Model Structure:\n", yolo_model.model)
     
     return yolo_model
 
 def run_yolo_training():
-    # SETTINGS: update the DATA path to your new dataset YAML file
-    MODEL_PATH = r"D:\YOLOV8-tomatod\ultralytics\ultralytics\cfg\models\v8\yolov8n.yaml"
+    # SETTINGS: Update dataset path
+    MODEL_PATH = "YOLOv8n.pt"
     NAME = 'tomatOD_run_effnet'
     DATA = 'tomatOD_yolo/data.yaml'  
     EPOCHS = 25
@@ -55,11 +71,14 @@ def run_yolo_training():
     SAVE_PERIOD = 1
     VAL = True
 
-    # ✅ Load YOLO model with EfficientNet backbone
+    # ✅ Load YOLO model
     model = YOLO(MODEL_PATH)
 
     # ✅ Modify YOLO model to use EfficientNet
     model = modify_model_for_efficientnet(model)
+
+    # Debugging: Check if EfficientNet is being used
+    print("🔍 Model after modification:\n", model.model)
 
     # ✅ Train the model
     train_results = model.train(
@@ -76,10 +95,10 @@ def run_yolo_training():
         lrf=LRF,
         momentum=MOMENTUM,
         val=VAL,
-        project="runs/detect" 
+        project="runs/detect"
     )
-    
-    # ✅ Validate checkpoints if available
+
+    # ✅ Validate checkpoints
     weights_path = os.path.join('runs', 'detect', NAME, 'weights')
     start_epoch = 1
     end_epoch = EPOCHS
@@ -104,16 +123,16 @@ def run_yolo_training():
                 file.write(str(m) + '\n')
             file.write('\n')
             file.write(str(metrics.box.map))
-    
+
     # ✅ Loop over epochs and validate only if the checkpoint exists
     for epoch in range(start_epoch, end_epoch, interval):
         weight_file = os.path.join(weights_path, f'epoch{epoch}.pt')
         if not os.path.exists(weight_file):
-            print(f"Weight file {weight_file} does not exist, skipping validation for epoch {epoch}.")
+            print(f"❌ Weight file {weight_file} does not exist, skipping validation for epoch {epoch}.")
             continue
         model = YOLO(weight_file)
         run_label = f"{NAME}_epoch_{epoch}"
-        
+
         # Validate on validation set
         val_metrics = model.val(
             imgsz=imgsz_val,
@@ -125,7 +144,7 @@ def run_yolo_training():
             max_det=max_det,
             name=f"{run_label}_val",
             split="val",
-            project="runs/detect" 
+            project="runs/detect"
         )
         write_results(run_label, val_metrics, split="val")
 
@@ -140,7 +159,7 @@ def run_yolo_training():
             max_det=max_det,
             name=f"{run_label}_test",
             split="test",
-            project="runs/detect" 
+            project="runs/detect"
         )
         write_results(run_label, test_metrics, split="test")
 
@@ -149,7 +168,7 @@ def run_yolo_training():
     if os.path.exists(weight_file):
         model = YOLO(weight_file)
         run_label = f"{NAME}_epoch_{EPOCHS}"
-        
+
         # Final validation
         val_metrics = model.val(
             imgsz=imgsz_val,
@@ -161,8 +180,7 @@ def run_yolo_training():
             max_det=max_det,
             name=f"{run_label}_val",
             split="val",
-            project="runs/detect" 
-            
+            project="runs/detect"
         )
         write_results(run_label, val_metrics, split="val")
 
@@ -177,12 +195,12 @@ def run_yolo_training():
             max_det=max_det,
             name=f"{run_label}_test",
             split="test",
-            project="runs/detect" 
+            project="runs/detect"
         )
         write_results(run_label, test_metrics, split="test")
-    
+
     else:
-        print("Final model weight file 'last.pt' does not exist.")
+        print("❌ Final model weight file 'last.pt' does not exist.")
 
 # ✅ Run the training
 run_yolo_training()
