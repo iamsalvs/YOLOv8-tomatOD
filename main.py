@@ -3,6 +3,8 @@ import torch
 import torch.nn as nn
 import torchvision.models as models
 from ultralytics import YOLO
+from thop import profile
+import copy
 
 class CustomBackbone(nn.Module):
     """EfficientNet-B0 Backbone for YOLOv8 with Feature Map Extraction and Channel Adjustment"""
@@ -12,8 +14,6 @@ class CustomBackbone(nn.Module):
         
         if backbone_type == 'efficientnet':
             self.backbone = models.efficientnet_b0(weights=models.EfficientNet_B0_Weights.IMAGENET1K_V1)
-
-            # Update these based on actual EfficientNet outputs:
             # P3 raw: 40 channels, P4 raw: 112 channels, P5 raw: 1280 channels
             self.eff_out_channels = [40, 112, 1280]  
             # Desired YOLO channels for P3, P4, P5
@@ -31,68 +31,78 @@ class CustomBackbone(nn.Module):
 
     def _get_feature_layers(self):
         """Extracts feature layers from EfficientNet"""
-        print("🔍 Extracting EfficientNet Feature Layers...")
+        print("🔍 Extracting EfficientNet Feature Layers...", flush=True)
     
         layers = {
-            'P3': self.backbone.features[:4],   # Responsible for P3 (should yield [*, 40, 38, 38])
-            'P4': self.backbone.features[4:6],    # Responsible for P4 (should yield [*, 112, 19, 19])
-            'P5': self.backbone.features[6:]      # Responsible for P5 (should yield [*, 1280, 10, 10])
+            'P3': self.backbone.features[:4],   # Expected output: [*, 40, 38, 38]
+            'P4': self.backbone.features[4:6],    # Expected output: [*, 112, 19, 19]
+            'P5': self.backbone.features[6:]      # Expected output: [*, 1280, 10, 10]
         }
     
         for name, layer in layers.items():
-            print(f"🔹 {name} Layer Extracted: {layer}")
+            print(f"🔹 {name} Layer Extracted: {layer}", flush=True)
     
         return nn.ModuleDict(layers)
 
     def forward(self, x):
-        print("🟢 Inside CustomBackbone forward()")
+        print("🟢 Inside CustomBackbone forward()", flush=True)
         # Compute raw feature maps sequentially:
         p3 = self.feature_layers['P3'](x)
-        print(f"✅ P3 raw: {p3.shape}")  # Expected: [batch, 40, 38, 38]
+        print(f"✅ P3 raw: {p3.shape}", flush=True)  # Expected: [batch, 40, 38, 38]
         
         p4 = self.feature_layers['P4'](p3)
-        print(f"✅ P4 raw: {p4.shape}")  # Expected: [batch, 112, 19, 19]
+        print(f"✅ P4 raw: {p4.shape}", flush=True)  # Expected: [batch, 112, 19, 19]
         
         p5 = self.feature_layers['P5'](p4)
-        print(f"✅ P5 raw: {p5.shape}")  # Expected: [batch, 1280, 10, 10]
+        print(f"✅ P5 raw: {p5.shape}", flush=True)  # Expected: [batch, 1280, 10, 10]
         
-        # Now adapt channels:
+        # Adapt channels:
         p3_out = self.channel_adapter[0](p3)
-        print(f"🚀 P3 after adapter: {p3_out.shape}")
+        print(f"🚀 P3 after adapter: {p3_out.shape}", flush=True)
         
         p4_out = self.channel_adapter[1](p4)
-        print(f"🚀 P4 after adapter: {p4_out.shape}")
+        print(f"🚀 P4 after adapter: {p4_out.shape}", flush=True)
         
         p5_out = self.channel_adapter[2](p5)
-        print(f"🚀 P5 after adapter: {p5_out.shape}")
+        print(f"🚀 P5 after adapter: {p5_out.shape}", flush=True)
         
         return [p3_out, p4_out, p5_out]
 
+class BackboneWrapper(nn.Module):
+    """
+    A wrapper to use the CustomBackbone for profiling.
+    Instead of returning a list of feature maps, it returns only the last one (p5_out).
+    """
+    def __init__(self, backbone):
+        super().__init__()
+        self.backbone = backbone
+    def forward(self, x):
+        outputs = self.backbone(x)
+        # Return only the final feature map for GFLOPs counting
+        return outputs[-1]
 
 def modify_model_for_efficientnet(yolo_model):
     """Replace YOLO's default backbone with EfficientNet-B0"""
     custom_backbone = CustomBackbone(backbone_type='efficientnet')
 
-    # Ensure YOLO model follows expected structure
     if hasattr(yolo_model.model, 'model') and len(yolo_model.model.model) > 0:
         yolo_model.model.model[0] = custom_backbone  # Replace YOLO backbone
-        print("✅ EfficientNet backbone has been successfully integrated into YOLO.")
+        print("✅ EfficientNet backbone has been successfully integrated into YOLO.", flush=True)
     else:
-        print("❌ Error: YOLOv8 model structure not recognized!")
+        print("❌ Error: YOLOv8 model structure not recognized!", flush=True)
 
-    # Force backbone to device
-    yolo_model.model = yolo_model.model.to('cuda' if torch.cuda.is_available() else 'cpu')
-    print("🔍 YOLO Model After Backbone Replacement:\n", yolo_model.model)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    yolo_model.model = yolo_model.model.to(device)
+    print("🔍 YOLO Model After Backbone Replacement:\n", yolo_model.model, flush=True)
     
     return yolo_model
 
-
 def run_yolo_training():
-    # SETTINGS: Update dataset path
-    MODEL_PATH = "yolov8n.pt"
+    # SETTINGS: Update paths and hyperparameters as needed
+    MODEL_PATH = "yolov8s.pt"
     NAME = 'tomatOD_run_effnet'
     DATA = 'tomatOD_yolo/data.yaml'  
-    EPOCHS = 25
+    EPOCHS = 5
     BATCH = 16
     IMGSZ = 300
     LR0 = 0.01
@@ -102,26 +112,42 @@ def run_yolo_training():
     SAVE_PERIOD = 1
     VAL = True
 
-    # Load YOLO model
+    # Load YOLO model and integrate the EfficientNet backbone
     model = YOLO(MODEL_PATH)
-
-    # Modify YOLO model to use EfficientNet
     model = modify_model_for_efficientnet(model)
 
-    # Debugging: Check backbone outputs with dummy input before training
-    print("🔍 Running EfficientNet Backbone Test...")
-    dummy_input = torch.randn(1, 3, 300, 300).to('cuda' if torch.cuda.is_available() else 'cpu')
-    backbone = model.model.model[0]  # Get Custom Backbone
-    feature_maps = backbone(dummy_input)
+    # Calculate total model parameters
+    print("🔍 Calculating Model Parameters...", flush=True)
+    total_params = sum(p.numel() for p in model.parameters()) / 1e6
+    print(f"✅ Total Model Parameters: {total_params:.2f}M", flush=True)
+    
+    # --- Compute GFLOPs on a separate backbone copy using a wrapper ---
+    print("🔍 Calculating GFLOPs for the backbone...", flush=True)
+    device = 'cuda' if torch.cuda.is_available() else 'cpu'
+    # Create a separate instance of the backbone for profiling:
+    backbone_for_profile = CustomBackbone(backbone_type='efficientnet').to(device)
+    # Wrap it so that its forward returns only the last feature map:
+    backbone_wrapper = BackboneWrapper(backbone_for_profile)
+    dummy_input = torch.randn(1, 3, IMGSZ, IMGSZ).to(device)
+    try:
+        flops, params = profile(backbone_wrapper, inputs=(dummy_input,))
+        print(f"✅ Backbone GFLOPs (using last feature map): {flops / 1e9:.2f} GFLOPs", flush=True)
+    except Exception as e:
+        print("❌ Error calculating GFLOPs:", e, flush=True)
+    
+    # --- Continue using the original model for further testing ---
+    print("🔍 Running EfficientNet Backbone Test...", flush=True)
+    dummy_input_test = torch.randn(1, 3, 300, 300).to(device)
+    backbone = model.model.model[0]  # Use the integrated backbone from the YOLO model
+    feature_maps = backbone(dummy_input_test)
     for i, fmap in enumerate(feature_maps):
-        print(f"🟢 Final Feature Map {i+1} Shape: {fmap.shape}")
+        print(f"🟢 Final Feature Map {i+1} Shape: {fmap.shape}", flush=True)
 
-    # Run YOLO training in debug mode for 1 epoch
-    print("🔍 Running YOLO Debug Mode (1 epoch)...")
+    print("🔍 Running YOLO Debug Mode (1 epoch)...", flush=True)
     model.train(
         data=DATA,
-        epochs=1,  # Debug run with 1 epoch
-        batch=1,   # Small batch size
+        epochs=1,
+        batch=1,
         imgsz=IMGSZ,
         workers=0,
         device=0,
@@ -130,7 +156,6 @@ def run_yolo_training():
         verbose=True
     )
 
-    # Run full training
     train_results = model.train(
         data=DATA,
         epochs=EPOCHS,
@@ -148,8 +173,7 @@ def run_yolo_training():
         project="runs/detect"
     )
 
-# ✅ **Testing after training (Validation on test set)**
-    print("🔍 Running YOLO Testing on Test Data...")
+    print("🔍 Running YOLO Testing on Test Data...", flush=True)
     test_results = model.val(
         data=DATA,
         imgsz=IMGSZ,
@@ -157,11 +181,10 @@ def run_yolo_training():
         workers=0,
         device=0,
         name=f"{NAME}_test_results",
-        split="test",  # ✅ Use the test split for evaluation
+        split="test",
         project="runs/test"
     )
 
-    # Save test results
     test_output_dir = os.path.join('runs', 'test', f"{NAME}_test_results")
     os.makedirs(test_output_dir, exist_ok=True)
     
@@ -169,7 +192,7 @@ def run_yolo_training():
         f.write(f"Test mAP50: {test_results.box.map50}\n")
         f.write(f"Test mAP: {test_results.box.map}\n")
 
-    print(f"✅ Test Results Saved to {test_output_dir}")
+    print(f"✅ Test Results Saved to {test_output_dir}", flush=True)
 
-# Run the training
-run_yolo_training()
+if __name__ == "__main__":
+    run_yolo_training()
