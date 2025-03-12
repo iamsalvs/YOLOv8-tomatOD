@@ -1,0 +1,8 @@
+# tomatOD dataset configuration for YOLOv8
+path: D:\YOLOV8-tomatod\tomatOD_yolo  # Change this to the actual path of your dataset
+train: train/images  # Path to training images
+val: val/images # Path to validation images
+test: test/images  # Path to test images (optional)
+
+nc: 3  # Number of classes
+names: ["unripe", "semi-ripe", "fully-ripe"]  # Class names
